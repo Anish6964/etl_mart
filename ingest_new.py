@@ -849,40 +849,54 @@ def ensure_dimension_tables(engine, df, master_df=None):
                     )
                     logger.info(f"Inserted/updated {len(sku_records)} SKUs from fact data")
 
-            # Populate dim_store from fact data
+            # Process store dimension data in batches to avoid worker timeouts
             if 'store_id' in df.columns:
-                store_records = []
-                for store_id in df['store_id'].unique():
-                    # Use store_id as default for store_name if not provided
-                    store_name = store_id
-                    # Use default values for missing columns
-                    store_records.append({
-                        'store_id': store_id,
-                        'store_name': store_name,
-                        'region': 'Unknown',
-                        'area': 'Unknown',
-                        'store_type': 'Unknown'
-                    })
+                store_ids = df['store_id'].unique()
+                batch_size = 1000  # Process 1000 stores at a time
+                total_stores = len(store_ids)
+                logger.info(f"Processing {total_stores} stores in batches of {batch_size}")
                 
-                if store_records:
-                    logger.info(f"Inserting/Updating {len(store_records)} stores from fact data")
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO dim_store (store_id, store_name, region, area, store_type)
-                            VALUES (:store_id, :store_name, :region, :area, :store_type)
-                            ON CONFLICT (store_id) 
-                            DO UPDATE SET 
-                                store_name = EXCLUDED.store_name,
-                                region = EXCLUDED.region,
-                                area = EXCLUDED.area,
-                                store_type = EXCLUDED.store_type,
-                                updated_at = CURRENT_TIMESTAMP
-                            """
-                        ),
-                        store_records
-                    )
-                    logger.info(f"Inserted/updated {len(store_records)} stores from fact data")
+                for i in range(0, total_stores, batch_size):
+                    batch = store_ids[i:i + batch_size]
+                    store_records = []
+                    for store_id in batch:
+                        # Use store_id as default for store_name if not provided
+                        store_name = store_id
+                        store_records.append({
+                            'store_id': store_id,
+                            'store_name': store_name,
+                            'region': 'Unknown',
+                            'area': 'Unknown',
+                            'store_type': 'Unknown'
+                        })
+                    
+                    if store_records:
+                        logger.info(f"Processing batch {i//batch_size + 1}/{(total_stores + batch_size - 1)//batch_size}")
+                        try:
+                            conn.execute(
+                                text(
+                                    """
+                                    INSERT INTO dim_store (store_id, store_name, region, area, store_type)
+                                    VALUES (:store_id, :store_name, :region, :area, :store_type)
+                                    ON CONFLICT (store_id) 
+                                    DO UPDATE SET 
+                                        store_name = EXCLUDED.store_name,
+                                        region = EXCLUDED.region,
+                                        area = EXCLUDED.area,
+                                        store_type = EXCLUDED.store_type,
+                                        updated_at = CURRENT_TIMESTAMP
+                                    """
+                                ),
+                                store_records
+                            )
+                            logger.info(f"Successfully processed batch {i//batch_size + 1}")
+                        except Exception as e:
+                            logger.error(f"Error processing batch {i//batch_size + 1}: {str(e)}")
+                            logger.error(f"Failed records: {len(store_records)}")
+                            # Log the first failed record for debugging
+                            if store_records:
+                                logger.error(f"Failed record example: {store_records[0]}")
+                            continue
 
             conn.commit()
             logger.info("Dimension tables populated successfully")
