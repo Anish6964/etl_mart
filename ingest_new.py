@@ -802,8 +802,6 @@ def ensure_dimension_tables(engine, df, master_df=None):
             
             # Populate dim_sku from fact data
             if 'sku_id' in df.columns:
-                logger.info("Processing fact data SKUs...")
-                
                 # Get all available SKU columns
                 sku_cols = ['sku_id', 'sku_name', 'category', 'subcategory', 'brand', 'supplier', 'rrp', 'cost']
                 available_sku_cols = [col for col in sku_cols if col in df.columns]
@@ -824,30 +822,46 @@ def ensure_dimension_tables(engine, df, master_df=None):
                     if col not in available_sku_cols:
                         df[col] = default_values[col]
                 
-                skus_to_insert = df[sku_cols].drop_duplicates('sku_id')
-                sku_records = skus_to_insert.to_dict("records")
+                sku_ids = df['sku_id'].unique()
+                batch_size = 1000  # Process 1000 SKUs at a time
+                total_skus = len(sku_ids)
+                logger.info(f"Processing {total_skus} SKUs in batches of {batch_size}")
                 
-                if sku_records:
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO dim_sku (sku_id, sku_name, category, subcategory, brand, supplier, rrp, cost)
-                            VALUES (:sku_id, :sku_name, :category, :subcategory, :brand, :supplier, :rrp, :cost)
-                            ON CONFLICT (sku_id) 
-                            DO UPDATE SET 
-                                sku_name = EXCLUDED.sku_name,
-                                category = EXCLUDED.category,
-                                subcategory = EXCLUDED.subcategory,
-                                brand = EXCLUDED.brand,
-                                supplier = EXCLUDED.supplier,
-                                rrp = EXCLUDED.rrp,
-                                cost = EXCLUDED.cost,
-                                updated_at = CURRENT_TIMESTAMP
-                            """
-                        ),
-                        sku_records
-                    )
-                    logger.info(f"Inserted/updated {len(sku_records)} SKUs from fact data")
+                for i in range(0, total_skus, batch_size):
+                    batch = sku_ids[i:i + batch_size]
+                    skus_to_insert = df[df['sku_id'].isin(batch)][sku_cols]
+                    sku_records = skus_to_insert.to_dict("records")
+                    
+                    if sku_records:
+                        logger.info(f"Processing SKU batch {i//batch_size + 1}/{(total_skus + batch_size - 1)//batch_size}")
+                        try:
+                            conn.execute(
+                                text(
+                                    """
+                                    INSERT INTO dim_sku (sku_id, sku_name, category, subcategory, brand, supplier, rrp, cost)
+                                    VALUES (:sku_id, :sku_name, :category, :subcategory, :brand, :supplier, :rrp, :cost)
+                                    ON CONFLICT (sku_id) 
+                                    DO UPDATE SET 
+                                        sku_name = EXCLUDED.sku_name,
+                                        category = EXCLUDED.category,
+                                        subcategory = EXCLUDED.subcategory,
+                                        brand = EXCLUDED.brand,
+                                        supplier = EXCLUDED.supplier,
+                                        rrp = EXCLUDED.rrp,
+                                        cost = EXCLUDED.cost,
+                                        updated_at = CURRENT_TIMESTAMP
+                                    """
+                                ),
+                                sku_records
+                            )
+                            logger.info(f"Successfully processed SKU batch {i//batch_size + 1}")
+                        except Exception as e:
+                            logger.error(f"Error processing SKU batch {i//batch_size + 1}: {str(e)}")
+                            logger.error(f"Failed SKU records: {len(sku_records)}")
+                            # Log the first failed record for debugging
+                            if sku_records:
+                                logger.error(f"Failed SKU record example: {sku_records[0]}")
+                            continue
 
             # Process store dimension data in batches to avoid worker timeouts
             if 'store_id' in df.columns:
