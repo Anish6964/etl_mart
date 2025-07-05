@@ -9,9 +9,6 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: 1
-      - key: DATABASE_URL
-        value: ""
-        sync: true
       - key: UPLOAD_DIR
         value: "uploads"
       - key: PORT

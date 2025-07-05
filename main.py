@@ -35,12 +35,28 @@ except Exception as e:
     logger.error(f"Database connection failed: {str(e)}")
     raise
 
-# Configure logging
+# Configure logging first
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Database configuration
+DB_URL = os.getenv('DATABASE_URL')
+if not DB_URL:
+    logger.error("DATABASE_URL environment variable not found. Using default connection string")
+    DB_URL = "postgresql://etl_user:etl_password@localhost:5432/etl_db"
+
+# Test database connection
+try:
+    engine = create_engine(DB_URL)
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT 1")).fetchone()
+    logger.info("Database connection successful")
+except Exception as e:
+    logger.error(f"Database connection failed: {str(e)}")
+    raise
 
 app = FastAPI(
     title="Supermarket POS ETL API",
@@ -58,18 +74,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Test database connection on startup
-@app.on_event("startup")
-def test_database_connection():
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT 1")).fetchone()
-        logger.info("Database connection successful")
-    except Exception as e:
-        logger.error(f"Database connection failed: {str(e)}")
-        raise
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 8000))
