@@ -13,6 +13,8 @@ services:
         sync: false  # This will be provided by Render
       - key: UPLOAD_DIR
         value: "uploads"
+      - key: PORT
+        value: "80"
     plan: free
 
 databases:

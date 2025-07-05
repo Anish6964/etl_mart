@@ -20,7 +20,9 @@ from run_etl_pipeline import run_etl_pipeline
 load_dotenv()
 
 # Database configuration
-DB_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5435/etl_db')
+DB_URL = os.getenv('DATABASE_URL')
+if not DB_URL:
+    raise ValueError("DATABASE_URL environment variable is required")
 
 # Configure logging
 logging.basicConfig(
@@ -45,6 +47,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Test database connection on startup
+@app.on_event("startup")
+def test_database_connection():
+    try:
+        engine = create_engine(DB_URL)
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1")).fetchone()
+        logger.info("Database connection successful")
+    except Exception as e:
+        logger.error(f"Database connection failed: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    port = int(os.getenv('PORT', 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 def get_table_columns(engine, table_name):
     """Get list of columns in a table"""
