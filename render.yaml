@@ -8,6 +8,10 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: 1
+      - key: DATABASE_URL
+        sync: false  # This will be provided by Render
+      - key: UPLOAD_DIR
+        value: "uploads"
     plan: free
 
 databases:
