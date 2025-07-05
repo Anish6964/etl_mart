@@ -190,10 +190,17 @@ async def health_check() -> Dict[str, str]:
     """Health check endpoint for monitoring"""
     return {"status": "healthy"}
 
-# Add startup event to ensure upload directory exists
+# Add startup event to ensure upload directory exists and database schema is initialized
 @app.on_event("startup")
 async def startup_event():
-    """Initialize application services."""
+    """Initialize application services and database schema."""
+    try:
+        from initialize_db import create_tables
+        create_tables(engine)
+        logger.info("Database schema initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database schema: {str(e)}")
+        raise
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     logger.info("Application startup: Initialized upload directory")
 
