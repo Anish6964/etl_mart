@@ -618,108 +618,280 @@ def ingest_and_clean_data(file_path: str) -> pd.DataFrame:
         logger.error(traceback.format_exc())
         raise
 
-def ensure_dimension_tables(engine, df):
-    """Ensure all dimension tables exist and are populated."""
-    with engine.connect() as conn:
-        # Create dim_sku if it doesn't exist
-        conn.execute(
-            text(
-                """
-            CREATE TABLE IF NOT EXISTS dim_sku (
-                sku_id VARCHAR(50) PRIMARY KEY,
-                item_name VARCHAR(255),
-                category VARCHAR(255),
-                department VARCHAR(255),
-                supplier_name VARCHAR(255),
-                rrp DECIMAL(10, 2),
-                cost DECIMAL(10, 2),
-                created_date DATE DEFAULT CURRENT_DATE
-            )
-        """
-            )
-        )
+def ensure_dimension_tables(engine, df, master_df=None):
+    """Ensure all dimension tables exist and are populated.
+    
+    Args:
+        engine: SQLAlchemy engine
+        df: Main fact data DataFrame
+        master_df: Optional master data DataFrame
+    """
+    try:
+        with engine.connect() as conn:
+            # First check if tables exist and get their columns
+            inspector = inspect(engine)
+            
+            # Get actual columns from dim_sku
+            if inspector.has_table('dim_sku'):
+                actual_sku_cols = inspector.get_columns('dim_sku')
+                actual_sku_col_names = [col['name'] for col in actual_sku_cols]
+                logger.info(f"Actual dim_sku columns: {actual_sku_col_names}")
+            else:
+                actual_sku_col_names = []
 
-        # Create dim_store if it doesn't exist
-        conn.execute(
-            text(
-                """
-            CREATE TABLE IF NOT EXISTS dim_store (
-                store_id VARCHAR(50) PRIMARY KEY,
-                store_name VARCHAR(255),
-                created_date DATE DEFAULT CURRENT_DATE
-            )
-        
-        """
-            )
-        )
+            # Get actual columns from dim_store
+            if inspector.has_table('dim_store'):
+                actual_store_cols = inspector.get_columns('dim_store')
+                actual_store_col_names = [col['name'] for col in actual_store_cols]
+                logger.info(f"Actual dim_store columns: {actual_store_col_names}")
+            else:
+                actual_store_col_names = []
 
-        # Populate dim_sku with unique SKUs from the data
-        # Handle both uppercase and lowercase column names
-        sku_columns = {
-            "id_col": "ITEM_CODE" if "ITEM_CODE" in df.columns else "sku_id",
-            "name_col": "ITEM_NAME" if "ITEM_NAME" in df.columns else "item_name",
-            "category_col": "CATEGORY" if "CATEGORY" in df.columns else "category",
-            "dept_col": "DEPARTMENT" if "DEPARTMENT" in df.columns else "department",
-            "supplier_col": (
-                "SUPPLIER_NAME" if "SUPPLIER_NAME" in df.columns else "supplier_name"
-            ),
-            "rrp_col": "RRP" if "RRP" in df.columns else "rrp",
-            "cost_col": "COST" if "COST" in df.columns else "cost",
-        }
-
-        required_cols = [sku_columns["id_col"], sku_columns["name_col"]]
-        if all(col in df.columns for col in required_cols):
-            # Get all columns that exist in the dataframe
-            available_cols = [
-                col
-                for col in [
-                    sku_columns["id_col"],
-                    sku_columns["name_col"],
-                    sku_columns["category_col"],
-                    sku_columns["dept_col"],
-                    sku_columns["supplier_col"],
-                    sku_columns["rrp_col"],
-                    sku_columns["cost_col"],
-                ]
-                if col in df.columns
-            ]
-
-            # Get unique SKUs that don't exist in dim_sku
-            skus_to_insert = df[available_cols].drop_duplicates(
-                subset=[sku_columns["id_col"]]
-            )
-
-            # Convert to list of dicts for batch insert
-            rename_map = {
-                sku_columns["id_col"]: "sku_id",
-                sku_columns["name_col"]: "item_name",
-                sku_columns["category_col"]: "category",
-                sku_columns["dept_col"]: "department",
-                sku_columns["supplier_col"]: "supplier_name",
-                sku_columns["rrp_col"]: "rrp",
-                sku_columns["cost_col"]: "cost",
-            }
-
-            # Only include columns that exist in the dataframe
-            rename_map = {
-                k: v for k, v in rename_map.items() if k in skus_to_insert.columns
-            }
-            sku_records = skus_to_insert.rename(columns=rename_map).to_dict("records")
-
-            # Insert new SKUs
-            if sku_records:
+            # Create dim_sku if it doesn't exist or needs schema updates
+            required_sku_cols = set(['sku_id', 'sku_name', 'category', 'subcategory', 'brand', 'supplier', 'rrp', 'cost', 'created_at', 'updated_at'])
+            
+            # If table doesn't exist, create it
+            if not actual_sku_col_names:
+                logger.info("Creating dim_sku table with initial schema...")
                 conn.execute(
                     text(
                         """
-                        INSERT INTO dim_sku (sku_id, item_name, category, department, supplier_name, rrp, cost)
-                        VALUES (:sku_id, :item_name, :category, :department, :supplier_name, :rrp, :cost)
-                        ON CONFLICT (sku_id) DO NOTHING
-                    """
-                    ),
-                    sku_records,
+                    CREATE TABLE dim_sku (
+                        sku_id VARCHAR(50) PRIMARY KEY,
+                        sku_name VARCHAR(255),
+                        category VARCHAR(255),
+                        subcategory VARCHAR(255),
+                        brand VARCHAR(255),
+                        supplier VARCHAR(255),
+                        rrp DECIMAL(10, 2),
+                        cost DECIMAL(10, 2),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+                    )
                 )
                 conn.commit()
-                logger.info(f"Inserted/updated {len(sku_records)} SKUs in dim_sku")
+                actual_sku_col_names = required_sku_cols
+                logger.info("Created dim_sku table successfully")
+            
+            # Check if we need to add any missing columns
+            missing_sku_cols = required_sku_cols - set(actual_sku_col_names)
+            if missing_sku_cols:
+                logger.info(f"Adding missing columns to dim_sku: {missing_sku_cols}")
+                for col in missing_sku_cols:
+                    if col in ['sku_id', 'sku_name', 'category', 'subcategory', 'brand', 'supplier']:
+                        conn.execute(
+                            text(f"ALTER TABLE dim_sku ADD COLUMN IF NOT EXISTS {col} VARCHAR(255)")
+                        )
+                    elif col in ['rrp', 'cost']:
+                        conn.execute(
+                            text(f"ALTER TABLE dim_sku ADD COLUMN IF NOT EXISTS {col} DECIMAL(10, 2)")
+                        )
+                    elif col in ['created_at', 'updated_at']:
+                        conn.execute(
+                            text(f"ALTER TABLE dim_sku ADD COLUMN IF NOT EXISTS {col} TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                        )
+                conn.commit()
+                logger.info(f"Added missing columns to dim_sku: {missing_sku_cols}")
+
+            # Create dim_store if it doesn't exist or needs schema updates
+            required_store_cols = set(['store_id', 'store_name', 'region', 'area', 'store_type', 'created_at', 'updated_at'])
+            
+            # If table doesn't exist, create it
+            if not actual_store_col_names:
+                logger.info("Creating dim_store table with initial schema...")
+                conn.execute(
+                    text(
+                        """
+                    CREATE TABLE dim_store (
+                        store_id VARCHAR(50) PRIMARY KEY,
+                        store_name VARCHAR(255),
+                        region VARCHAR(255),
+                        area VARCHAR(255),
+                        store_type VARCHAR(50),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+                    )
+                )
+                conn.commit()
+                actual_store_col_names = required_store_cols
+                logger.info("Created dim_store table successfully")
+            
+            # Check if we need to add any missing columns
+            missing_store_cols = required_store_cols - set(actual_store_col_names)
+            if missing_store_cols:
+                logger.info(f"Adding missing columns to dim_store: {missing_store_cols}")
+                for col in missing_store_cols:
+                    if col in ['store_id', 'store_name', 'region', 'area', 'store_type']:
+                        conn.execute(
+                            text(f"ALTER TABLE dim_store ADD COLUMN IF NOT EXISTS {col} VARCHAR(255)")
+                        )
+                    elif col in ['created_at', 'updated_at']:
+                        conn.execute(
+                            text(f"ALTER TABLE dim_store ADD COLUMN IF NOT EXISTS {col} TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                        )
+                conn.commit()
+                logger.info(f"Added missing columns to dim_store: {missing_store_cols}")
+
+            # First try to populate from master data if available
+            if master_df is not None:
+                logger.info("Populating dimension tables from master data...")
+                
+                # Populate dim_sku from master data
+                if 'sku_id' in master_df.columns:
+                    sku_cols = ['sku_id', 'sku_name', 'category', 'subcategory', 'brand', 'supplier', 'rrp', 'cost']
+                    available_sku_cols = [col for col in sku_cols if col in master_df.columns]
+                    
+                    skus_to_insert = master_df[available_sku_cols].drop_duplicates('sku_id')
+                    sku_records = skus_to_insert.to_dict("records")
+                    
+                    if sku_records:
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO dim_sku (sku_id, sku_name, category, subcategory, brand, supplier, rrp, cost)
+                                VALUES (:sku_id, :sku_name, :category, :subcategory, :brand, :supplier, :rrp, :cost)
+                                ON CONFLICT (sku_id) 
+                                DO UPDATE SET 
+                                    sku_name = EXCLUDED.sku_name,
+                                    category = EXCLUDED.category,
+                                    subcategory = EXCLUDED.subcategory,
+                                    brand = EXCLUDED.brand,
+                                    supplier = EXCLUDED.supplier,
+                                    rrp = EXCLUDED.rrp,
+                                    cost = EXCLUDED.cost,
+                                    updated_at = CURRENT_TIMESTAMP
+                                """
+                            ),
+                            sku_records
+                        )
+                        logger.info(f"Inserted/updated {len(sku_records)} SKUs from master data")
+
+                # Populate dim_store from master data
+                if 'store_id' in master_df.columns:
+                    store_cols = ['store_id', 'store_name', 'region', 'area', 'store_type']
+                    available_store_cols = [col for col in store_cols if col in master_df.columns]
+                    
+                    stores_to_insert = master_df[available_store_cols].drop_duplicates('store_id')
+                    store_records = stores_to_insert.to_dict("records")
+                    
+                    if store_records:
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO dim_store (store_id, store_name, region, area, store_type)
+                                VALUES (:store_id, :store_name, :region, :area, :store_type)
+                                ON CONFLICT (store_id) 
+                                DO UPDATE SET 
+                                    store_name = EXCLUDED.store_name,
+                                    region = EXCLUDED.region,
+                                    area = EXCLUDED.area,
+                                    store_type = EXCLUDED.store_type,
+                                    updated_at = CURRENT_TIMESTAMP
+                                """
+                            ),
+                            store_records
+                        )
+                        logger.info(f"Inserted/updated {len(store_records)} stores from master data")
+
+            # Then populate from fact data if needed
+            logger.info("Populating dimension tables from fact data...")
+            
+            # Populate dim_sku from fact data
+            if 'sku_id' in df.columns:
+                logger.info("Processing fact data SKUs...")
+                
+                # Get all available SKU columns
+                sku_cols = ['sku_id', 'sku_name', 'category', 'subcategory', 'brand', 'supplier', 'rrp', 'cost']
+                available_sku_cols = [col for col in sku_cols if col in df.columns]
+                
+                # Add default values for missing columns
+                default_values = {
+                    'sku_name': 'Unknown SKU',
+                    'category': 'Unknown',
+                    'subcategory': 'Unknown',
+                    'brand': 'Unknown',
+                    'supplier': 'Unknown',
+                    'rrp': 0.0,
+                    'cost': 0.0
+                }
+                
+                # Add default values for any missing columns
+                for col in sku_cols:
+                    if col not in available_sku_cols:
+                        df[col] = default_values[col]
+                
+                skus_to_insert = df[sku_cols].drop_duplicates('sku_id')
+                sku_records = skus_to_insert.to_dict("records")
+                
+                if sku_records:
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO dim_sku (sku_id, sku_name, category, subcategory, brand, supplier, rrp, cost)
+                            VALUES (:sku_id, :sku_name, :category, :subcategory, :brand, :supplier, :rrp, :cost)
+                            ON CONFLICT (sku_id) 
+                            DO UPDATE SET 
+                                sku_name = EXCLUDED.sku_name,
+                                category = EXCLUDED.category,
+                                subcategory = EXCLUDED.subcategory,
+                                brand = EXCLUDED.brand,
+                                supplier = EXCLUDED.supplier,
+                                rrp = EXCLUDED.rrp,
+                                cost = EXCLUDED.cost,
+                                updated_at = CURRENT_TIMESTAMP
+                            """
+                        ),
+                        sku_records
+                    )
+                    logger.info(f"Inserted/updated {len(sku_records)} SKUs from fact data")
+
+            # Populate dim_store from fact data
+            if 'store_id' in df.columns:
+                store_records = []
+                for store_id in df['store_id'].unique():
+                    # Use store_id as default for store_name if not provided
+                    store_name = store_id
+                    # Use default values for missing columns
+                    store_records.append({
+                        'store_id': store_id,
+                        'store_name': store_name,
+                        'region': 'Unknown',
+                        'area': 'Unknown',
+                        'store_type': 'Unknown'
+                    })
+                
+                if store_records:
+                    logger.info(f"Inserting/Updating {len(store_records)} stores from fact data")
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO dim_store (store_id, store_name, region, area, store_type)
+                            VALUES (:store_id, :store_name, :region, :area, :store_type)
+                            ON CONFLICT (store_id) 
+                            DO UPDATE SET 
+                                store_name = EXCLUDED.store_name,
+                                region = EXCLUDED.region,
+                                area = EXCLUDED.area,
+                                store_type = EXCLUDED.store_type,
+                                updated_at = CURRENT_TIMESTAMP
+                            """
+                        ),
+                        store_records
+                    )
+                    logger.info(f"Inserted/updated {len(store_records)} stores from fact data")
+
+            conn.commit()
+            logger.info("Dimension tables populated successfully")
+
+    except Exception as e:
+        logger.error(f"Error populating dimension tables: {e}")
+        raise
+        conn.commit()
+        logger.info(f"Inserted/updated {len(sku_records)} SKUs in dim_sku")
 
         # Populate dim_store with unique stores from the data
         # Handle both uppercase and lowercase column names
@@ -1621,7 +1793,6 @@ def main():
 
         # Create database connection with extended timeout settings
         logger.info("Establishing database connection...")
-        # Create database connection using DATABASE_URL
         engine = create_db_connection()
         if not engine:
             logger.error("Failed to connect to the database using DATABASE_URL")
@@ -1661,22 +1832,29 @@ def main():
         logger.info("\n=== Step 2: Checking and updating database schema ===")
         update_database_schema(engine)
 
-        # Run the ETL pipeline
-        logger.info("\n=== Step 3: Running ETL pipeline ===")
-
         # Step 1: Ingest and clean data
-        logger.info("\n=== Step 3.1: Ingesting, cleaning, and transforming data ===")
+        logger.info("\n=== Step 3: Ingesting and cleaning data ===")
         df = ingest_and_clean_data(args.input_file)
         if df is None or df.empty:
             logger.error("No data to process after cleaning. Exiting.")
             return 1
 
+        # If master file exists, read it first
+        master_df = None
+        if args.master_file:
+            logger.info("\n=== Step 4: Processing master data ===")
+            try:
+                master_df = pd.read_excel(args.master_file)
+                logger.info(f"Successfully read master data with {len(master_df)} records")
+            except Exception as e:
+                logger.warning(f"Could not read master file: {e}")
+
         # Step 2: Ensure dimension tables are populated
-        logger.info("\n=== Step 3.2: Populating dimension tables ===")
-        ensure_dimension_tables(engine, df)
+        logger.info("\n=== Step 5: Populating dimension tables ===")
+        ensure_dimension_tables(engine, df, master_df)
 
         # Step 3: Insert data into the fact table
-        logger.info("\n=== Step 3.3: Loading data into fact table ===")
+        logger.info("\n=== Step 6: Loading data into fact table ===")
         total_inserted, total_errors = insert_fact_data(engine, df, args.retailer_id)
 
         # Log basic statistics about the transformed data
@@ -1694,7 +1872,7 @@ def main():
             min_date = df["date"].min()
             max_date = df["date"].max()
             logger.info(
-                f"\n=== Step 7: Ensuring time dimension is populated from {min_date} to {max_date} ==="
+                f"\n=== Step 8: Ensuring time dimension is populated from {min_date} to {max_date} ==="
             )
             populate_time_dimension(engine, min_date, max_date)
 
