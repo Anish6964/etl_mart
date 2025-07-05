@@ -41,7 +41,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Database configuration
-DB_URL = "postgresql://postgres:postgres@localhost:5435/etl_db"
+DB_URL = os.getenv('DATABASE_URL')
+if not DB_URL:
+    logger.error("DATABASE_URL environment variable not found")
+    DB_URL = "postgresql://postgres:postgres@localhost:5435/etl_db"
 DEFAULT_RETAILER_ID = "DEFAULT_RETAILER"
 DEFAULT_RETAILER_NAME = "Default Retailer"
 
