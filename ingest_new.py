@@ -302,6 +302,88 @@ def ensure_retailer_exists(engine, retailer_id):
             logger.info(f"Found existing retailer: {retailer_id}")
 
 
+def populate_time_dimension(engine, start_date: datetime.date, end_date: datetime.date) -> None:
+    """
+    Populate the time dimension table with all dates between start_date and end_date.
+    Only creates tables and inserts data if they don't already exist.
+    
+    Args:
+        engine: SQLAlchemy engine
+        start_date: Start date for time dimension
+        end_date: End date for time dimension
+    """
+    try:
+        logger.info(f"Populating time dimension from {start_date} to {end_date}")
+        
+        # Check if table exists first
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables 
+                    WHERE table_schema = 'public' 
+                    AND table_name = 'dim_time'
+                )
+                """
+            ))
+            table_exists = result.scalar()
+            
+            if not table_exists:
+                # Create table and insert initial data only if it doesn't exist
+                logger.info("Creating dim_time table and populating initial data...")
+                
+                # Create table
+                conn.execute(text(
+                    """
+                    CREATE TABLE dim_time (
+                        date DATE PRIMARY KEY,
+                        day_of_week INTEGER,
+                        day_name VARCHAR(10),
+                        week_number INTEGER,
+                        month_number INTEGER,
+                        month_name VARCHAR(10),
+                        quarter INTEGER,
+                        year INTEGER,
+                        is_weekend BOOLEAN
+                    )
+                    """
+                ))
+                conn.commit()
+                
+                # Create DataFrame with all dates
+                date_range = pd.date_range(start=start_date, end=end_date)
+                time_df = pd.DataFrame({
+                    'date': date_range.date,
+                    'day_of_week': date_range.dayofweek + 1,  # 1-7 instead of 0-6
+                    'day_name': date_range.strftime('%A'),
+                    'week_number': date_range.isocalendar().week,
+                    'month_number': date_range.month,
+                    'month_name': date_range.strftime('%B'),
+                    'quarter': (date_range.month - 1) // 3 + 1,
+                    'year': date_range.year,
+                    'is_weekend': date_range.dayofweek.isin([5, 6])  # Saturday and Sunday
+                })
+                
+                # Insert initial data
+                time_df.to_sql(
+                    'dim_time',
+                    engine,
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=1000
+                )
+                logger.info("Time dimension created and populated successfully")
+                return
+            
+            # If table exists, just log and return - no need to modify existing data
+            logger.info("Time dimension table already exists - skipping initialization")
+            return
+            
+    except Exception as e:
+        logger.error(f"Error populating time dimension: {e}")
+        raise
+
 def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Transform the validated data into the target schema.
@@ -938,7 +1020,204 @@ def insert_dimension_data(engine, df, table_name, id_col, value_cols, retailer_i
         return 0
 
 
-def insert_fact_data(engine, df, retailer_id):
+def insert_fact_data(engine, df, retailer_id, process_type='incremental', last_processed_date=None):
+    """
+    Insert data into the fact_sales table with upsert functionality.
+    Supports both full and incremental processing.
+
+    Args:
+        engine: SQLAlchemy engine
+        df: DataFrame containing fact data to insert
+        retailer_id: ID of the retailer
+        process_type: 'full' or 'incremental'
+        last_processed_date: Date to use as watermark for incremental processing
+
+    Returns:
+        Tuple of (total_inserted, total_errors)
+    """
+    total_inserted = 0
+    total_errors = 0
+    batch_size = 1000
+
+    if df.empty:
+        logger.warning("No fact data to insert")
+        return 0, 0
+
+    required_columns = [
+        "retailer_id",
+        "store_id",
+        "sku_id",
+        "date",
+        "units_sold",
+        "sales_value",
+        "price",
+        "promo_active",
+    ]
+
+    # Ensure all required columns exist
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        logger.error(
+            f"Missing required columns in fact data: {', '.join(missing_columns)}"
+        )
+        return 0, len(df)  # All rows are considered errors
+
+    # Prepare data for insertion
+    fact_data = df[required_columns].copy()
+
+    # Convert date to string for SQL
+    fact_data["date"] = pd.to_datetime(fact_data["date"]).dt.date
+
+    # If incremental processing, filter for new data
+    if process_type == 'incremental' and last_processed_date:
+        logger.info(f"Filtering for data newer than {last_processed_date}")
+        fact_data = fact_data[fact_data["date"] > last_processed_date]
+        if fact_data.empty:
+            logger.info("No new data to process after filtering")
+            return 0, 0
+
+    # Get valid SKUs and stores from dimension tables
+    with engine.connect() as conn:
+        # Get all valid SKU IDs
+        valid_skus = (
+            pd.read_sql("SELECT DISTINCT sku_id FROM dim_sku", conn)["sku_id"]
+            .astype(str)
+            .tolist()
+        )
+        # Get all valid store IDs
+        valid_stores = (
+            pd.read_sql("SELECT DISTINCT store_id FROM dim_store", conn)["store_id"]
+            .astype(str)
+            .tolist()
+        )
+
+    # Filter out rows with invalid SKUs or stores
+    original_count = len(fact_data)
+    fact_data = fact_data[
+        fact_data["sku_id"].astype(str).isin(valid_skus)
+        & fact_data["store_id"].astype(str).isin(valid_stores)
+    ]
+
+    filtered_count = original_count - len(fact_data)
+    if filtered_count > 0:
+        logger.warning(
+            f"Filtered out {filtered_count} rows with invalid SKUs or stores"
+        )
+
+    if fact_data.empty:
+        logger.error("No valid fact data to insert after filtering")
+        return 0, original_count  # All rows are considered errors
+
+    # Track maximum date processed
+    max_date = fact_data["date"].max()
+
+    # Process in batches
+    for i in range(0, len(fact_data), batch_size):
+        batch = fact_data.iloc[i : i + batch_size]
+        batch_errors = 0
+
+        with engine.connect() as conn:
+            # Start a transaction for this batch
+            with conn.begin():
+                for idx, row in batch.iterrows():
+                    try:
+                        # Prepare values with proper type handling
+                        values = {
+                            "retailer_id": str(row["retailer_id"]),
+                            "store_id": str(row["store_id"]),
+                            "sku_id": str(row["sku_id"]),
+                            "date": row["date"],
+                            "units_sold": int(row["units_sold"]),
+                            "sales_value": float(row["sales_value"]),
+                            "price": float(row["price"]),
+                            "promo_active": bool(row["promo_active"]),
+                            "stock_level": int(row.get("stock_level", 0)),
+                            "cost": float(
+                                row.get("cost", row["price"] * 0.7)
+                            ),  # Default cost if not provided
+                        }
+
+                        # Build the upsert query
+                        columns = list(values.keys())
+                        placeholders = {
+                            f"param_{i}": val
+                            for i, val in enumerate(values.values(), 1)
+                        }
+
+                        # Generate the SET clause for updates
+                        set_clause = ", ".join([
+                            f"{col} = EXCLUDED.{col}"
+                            for col in columns
+                            if col not in ["retailer_id", "store_id", "sku_id", "date"]
+                        ])
+
+                        # Build the query with parameterized values
+                        query = f"""
+                            INSERT INTO fact_sales ({', '.join(columns)})
+                            VALUES ({', '.join([f':param_{i+1}' for i in range(len(columns))])})
+                            ON CONFLICT (retailer_id, store_id, sku_id, date) 
+                            DO UPDATE SET {set_clause}
+                            RETURNING 1
+                        """
+
+                        # Execute with parameters to prevent SQL injection
+                        result = conn.execute(text(query), placeholders)
+                        total_inserted += 1
+
+                        # Log progress
+                        if total_inserted % 1000 == 0:
+                            logger.info(f"  - Processed {total_inserted} fact records")
+
+                    except Exception as row_error:
+                        batch_errors += 1
+                        total_errors += 1
+                        if batch_errors <= 3:  # Log first few errors
+                            logger.warning(
+                                f"  Error in fact row {idx}: {str(row_error)[:200]}"
+                            )
+                            if batch_errors == 3:
+                                logger.warning(
+                                    "  Additional errors in this batch will be suppressed..."
+                                )
+                        continue
+
+                # Commit the transaction for this batch
+                conn.commit()
+
+        # Log batch completion
+        logger.info(
+            f"  - Completed batch {i//batch_size + 1}/{(len(fact_data)-1)//batch_size + 1} for fact_sales"
+        )
+
+    # Log final results
+    if total_errors > 0:
+        logger.warning(
+            f"Completed fact_sales with {total_inserted} rows processed and {total_errors} errors"
+        )
+    else:
+        logger.info(f"Successfully processed {total_inserted} rows in fact_sales")
+
+    # Verify the final count and update watermark
+    with engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM fact_sales")).scalar()
+        logger.info(f"  - Final row count in fact_sales: {count:,}")
+        
+        # Update last processed date in metadata table
+        try:
+            conn.execute(text(
+                """
+                INSERT INTO etl_metadata (key, value, updated_at)
+                VALUES ('last_processed_date', :max_date, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) 
+                DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+                """
+            ), {"max_date": str(max_date)})
+            conn.commit()
+            logger.info(f"Updated last processed date to {max_date}")
+        except Exception as e:
+            logger.warning(f"Could not update last processed date: {e}")
+
+    return total_inserted, total_errors
     """
     Insert data into the fact_sales table with upsert functionality.
 
