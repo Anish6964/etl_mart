@@ -22,7 +22,18 @@ load_dotenv()
 # Database configuration
 DB_URL = os.getenv('DATABASE_URL')
 if not DB_URL:
-    raise ValueError("DATABASE_URL environment variable is required")
+    logger.error("DATABASE_URL environment variable not found. Using default connection string")
+    DB_URL = "postgresql://etl_user:etl_password@localhost:5432/etl_db"
+
+# Test database connection
+try:
+    engine = create_engine(DB_URL)
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT 1")).fetchone()
+    logger.info("Database connection successful")
+except Exception as e:
+    logger.error(f"Database connection failed: {str(e)}")
+    raise
 
 # Configure logging
 logging.basicConfig(

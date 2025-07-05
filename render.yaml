@@ -10,7 +10,8 @@ services:
       - key: PYTHONUNBUFFERED
         value: 1
       - key: DATABASE_URL
-        sync: false  # This will be provided by Render
+        value: ""
+        sync: true
       - key: UPLOAD_DIR
         value: "uploads"
       - key: PORT
@@ -18,7 +19,8 @@ services:
     plan: free
 
 databases:
-  - name: etl-db
+  - type: postgresql
+    name: etl-db
     databaseName: etl_db
     user: etl_user
     plan: free
