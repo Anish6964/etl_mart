@@ -13,6 +13,7 @@ import shutil
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import pathlib
+from run_etl_pipeline import run_etl_pipeline
 
 # Configure logging first
 logging.basicConfig(

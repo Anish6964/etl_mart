@@ -140,6 +140,36 @@ def find_master_file():
     return None
 
 
+def run_etl_pipeline(data_file: str, master_file: Optional[str] = None, retailer_id: str = "1") -> bool:
+    """
+    Run the ETL pipeline for the given files.
+    
+    Args:
+        data_file: Path to the input data file (CSV/Excel)
+        master_file: Optional path to the master SKU file (Excel)
+        retailer_id: Retailer ID
+        
+    Returns:
+        bool: True if pipeline completed successfully, False otherwise
+    """
+    logger.info(f"🚀 Starting ETL Pipeline for retailer {retailer_id}")
+    logger.info("=" * 60)
+
+    # Run data ingestion
+    if not run_script("ingest_new.py", ["--data-file", data_file, "--retailer-id", retailer_id]):
+        return False
+
+    # Run KPI calculations
+    if not run_script("kpi_queries.py", ["--retailer-id", retailer_id]):
+        return False
+
+    # Run BI view creation
+    if not run_script("create_bi_views.py", ["--retailer-id", retailer_id]):
+        return False
+
+    logger.info("✅ ETL Pipeline completed successfully")
+    return True
+
 def main():
     args = parse_arguments()
     start_time = datetime.now()
