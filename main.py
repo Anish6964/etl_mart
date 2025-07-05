@@ -12,9 +12,14 @@ import traceback
 import shutil
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+import pathlib
 
-# Import the ETL pipeline function
-from run_etl_pipeline import run_etl_pipeline
+# Configure logging first
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -25,32 +30,11 @@ if not DB_URL:
     logger.error("DATABASE_URL environment variable not found. Using default connection string")
     DB_URL = "postgresql://etl_user:etl_password@localhost:5432/etl_db"
 
-# Test database connection
-try:
-    engine = create_engine(DB_URL)
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT 1")).fetchone()
-    logger.info("Database connection successful")
-except Exception as e:
-    logger.error(f"Database connection failed: {str(e)}")
-    raise
-
-# Configure logging first
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Database configuration
-DB_URL = os.getenv('DATABASE_URL')
-if not DB_URL:
-    logger.error("DATABASE_URL environment variable not found. Using default connection string")
-    DB_URL = "postgresql://etl_user:etl_password@localhost:5432/etl_db"
+# Create engine once and reuse it
+engine = create_engine(DB_URL)
 
 # Test database connection
 try:
-    engine = create_engine(DB_URL)
     with engine.connect() as conn:
         result = conn.execute(text("SELECT 1")).fetchone()
     logger.info("Database connection successful")
