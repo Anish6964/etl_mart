@@ -33,6 +33,78 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 
+def clean_text(text: str) -> str:
+    """Clean and standardize text data."""
+    if not isinstance(text, str) or pd.isna(text):
+        return ""
+    # Remove extra whitespace and convert to title case
+    return " ".join(str(text).strip().split()).title()
+
+
+def extract_pack_size(sku_name: str) -> str:
+    """Extract pack size from SKU name."""
+    if not isinstance(sku_name, str):
+        return ""
+    # Look for patterns like 100g, 1kg, 500ml, etc.
+    match = re.search(
+        r"(\d+\s*(?:g|kg|ml|l|oz|lb|pcs?|pack|pk|ct))", sku_name, re.IGNORECASE
+    )
+    return match.group(1) if match else ""
+
+
+def validate_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Validate the input DataFrame for data quality issues.
+
+    Args:
+        df: Input DataFrame to validate
+
+    Returns:
+        Tuple of (validated DataFrame, validation_stats)
+    """
+    validation_stats = {
+        "total_records": len(df),
+        "missing_required_fields": 0,
+        "invalid_numeric_values": 0,
+        "negative_values": 0,
+        "invalid_dates": 0,
+        "duplicate_records": 0,
+    }
+
+    # Make a copy to avoid modifying the original
+    df_validated = df.copy()
+
+    # 1. Map actual column names to expected names
+    column_mapping = {
+        "STORE_NAME": "STORE_ID",
+        "ITEM_CODE": "ITEM_CODE",
+        "QTY": "QTY",
+        "SALES_PRE_VAT": "SALES_AMOUNT",
+        "Date": "DATE",
+    }
+
+    # Rename columns to standardize them
+    df_validated = df_validated.rename(columns=column_mapping)
+
+    # 2. Check for required fields
+    required_fields = ["STORE_ID", "ITEM_CODE", "QTY", "SALES_AMOUNT", "DATE"]
+
+    # Check which required fields are missing
+    missing_columns = [
+        col for col in required_fields if col not in df_validated.columns
+    ]
+    if missing_columns:
+        logger.warning(f"Missing required columns: {', '.join(missing_columns)}")
+
+    # Check for null values in existing required columns
+    existing_required = [col for col in required_fields if col in df_validated.columns]
+    if existing_required:
+        missing_required = df_validated[existing_required].isnull().any(axis=1)
+        validation_stats["missing_required_fields"] = missing_required.sum()
+    else:
+        validation_stats["missing_required_fields"] = len(df_validated)
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -185,6 +257,240 @@ def ensure_retailer_exists(engine, retailer_id):
         else:
             logger.info(f"Found existing retailer: {retailer_id}")
 
+
+def transform_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transform the validated data into the target schema.
+    
+    Args:
+        df: Validated DataFrame from validate_data()
+        
+    Returns:
+        DataFrame: Transformed data ready for database insertion
+    """
+    logger.info("Starting data transformation")
+    
+    try:
+        # Create a copy to avoid modifying the original
+        df_transformed = df.copy()
+        
+        # Map source columns to target columns
+        column_mapping = {
+            "STORE_ID": "store_id",
+            "ITEM_CODE": "sku_id",
+            "QTY": "units_sold",
+            "SALES_AMOUNT": "sales_value",
+            "DATE": "date",
+            "RRP": "price",  # Use RRP as price if PRICE is not available
+            "COST": "cost",
+            "STOCK": "stock_level",  # Use STOCK if STOCK_LEVEL is not available
+            "RETAILER_ID": "retailer_id",
+            "retailer_id": "retailer_id",
+        }
+        
+        # Initialize all required columns with None
+        required_columns = [
+            "store_id",
+            "sku_id",
+            "units_sold",
+            "sales_value",
+            "date",
+            "price",
+            "cost",
+            "stock_level",
+            "promo_active",
+            "retailer_id",
+        ]
+        
+        # Create a new DataFrame with all required columns
+        result = pd.DataFrame(columns=required_columns)
+        
+        # Map and copy columns that exist in the source
+        for src_col, tgt_col in column_mapping.items():
+            if src_col in df_transformed.columns:
+                result[tgt_col] = df_transformed[src_col]
+        
+        # If retailer_id is not in the source, try to get it from the command line args
+        if (
+            "retailer_id" not in result.columns
+            and "RETAILER_ID" not in df_transformed.columns
+        ):
+            try:
+                args = parse_arguments()
+                result["retailer_id"] = args.retailer_id
+                logger.info(f"Added retailer_id from command line: {args.retailer_id}")
+            except Exception as e:
+                logger.warning(f"Could not get retailer_id from command line: {e}")
+                result["retailer_id"] = "DEFAULT_RETAILER"
+        
+        # Set default values for missing required columns
+        if "promo_active" not in result.columns:
+            result["promo_active"] = False
+        
+        # If price is still missing, try to calculate from sales_value/units_sold
+        if (
+            "price" not in result.columns
+            and "sales_value" in result.columns
+            and "units_sold" in result.columns
+        ):
+            result["price"] = result["sales_value"] / result["units_sold"].replace(0, 1)
+        
+        # Set default stock level if missing
+        if "stock_level" not in result.columns:
+            result["stock_level"] = 0
+        
+        # Set default cost if missing
+        if "cost" not in result.columns:
+            result["cost"] = 0
+        
+        # Convert date to datetime.date
+        if "date" in result.columns:
+            try:
+                result["date"] = pd.to_datetime(
+                    result["date"], format="%d/%m/%Y", errors="coerce"
+                )
+                if result["date"].isna().all():
+                    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+                result["date"] = result["date"].dt.date
+                if result["date"].isna().all():
+                    result["date"] = pd.Timestamp.today().date()
+            except Exception as e:
+                logger.warning(
+                    f"Error parsing dates: {e}. Using today's date as fallback."
+                )
+                result["date"] = pd.Timestamp.today().date()
+        else:
+            result["date"] = pd.Timestamp.today().date()
+        
+        # Ensure promo_active is boolean
+        if "promo_active" not in result.columns:
+            result["promo_active"] = False
+        result["promo_active"] = result["promo_active"].fillna(False).astype(bool)
+        
+        # Ensure numeric columns have the correct type and handle any non-numeric values
+        numeric_columns = ["units_sold", "sales_value", "price", "cost", "stock_level"]
+        for col in numeric_columns:
+            if col in result.columns:
+                result[col] = pd.to_numeric(result[col], errors="coerce")
+                result[col] = result[col].fillna(0)
+        
+        # Check for missing required columns
+        missing_columns = [
+            col
+            for col in required_columns
+            if col not in result.columns or result[col].isnull().all()
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"Missing required columns after transformation: {', '.join(missing_columns)}"
+            )
+        
+        logger.info(f"Successfully transformed {len(result)} records")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error during data transformation: {e}")
+        logger.error(traceback.format_exc())
+        raise
+
+def ingest_and_clean_data(file_path: str) -> pd.DataFrame:
+    """
+    Ingest, validate, and transform data from the CSV file.
+    """
+    logger.info(f"Starting data ingestion from {file_path}")
+    
+    try:
+        dtypes = {
+            "STORE_NAME": "str",
+            "ITEM_CODE": "str",
+            "ITEM_NAME": "str",
+            "CATEGORY": "str",
+            "DEPARTMENT": "str",
+            "QTY": "str",
+            "COST": "str",
+            "SALES_PRE_VAT": "str",
+            "SUPPLIER_NAME": "str",
+            "Date": "str",
+            "RRP": "str",
+            "PRICE": "str",
+            "TRANS_DATE": "str",
+            "PROMO_FLAG": "str",
+            "STOCK_LEVEL": "str",
+            "STOCK": "str",
+        }
+        
+        try:
+            df = pd.read_csv(
+                file_path,
+                dtype=dtypes,
+                low_memory=False,
+                encoding="utf-8-sig",
+                thousands=",",
+            )
+        except UnicodeDecodeError:
+            logger.info("UTF-8 with BOM failed, trying latin-1 encoding...")
+            df = pd.read_csv(
+                file_path,
+                dtype=dtypes,
+                low_memory=False,
+                encoding="latin1",
+                thousands=",",
+            )
+            
+        logger.info(f"Successfully read {len(df):,} rows from {file_path}")
+        
+        df.columns = df.columns.str.strip()
+        df.columns = df.columns.str.replace("\ufeff", "")
+        
+        logger.info("Starting data validation...")
+        df, validation_stats = validate_data(df)
+        
+        logger.info("\n=== Data Validation Summary ===")
+        logger.info(f"Total records processed: {validation_stats['total_records']:,}")
+        
+        valid_records = len(df)
+        logger.info(
+            f"\nValid records remaining: {valid_records:,} "
+            f"({valid_records/validation_stats['total_records']*100:.1f}% of original)"
+        )
+        
+        if valid_records == 0:
+            logger.warning("No valid records remaining after validation!")
+            return pd.DataFrame()
+        
+        # Add retailer_id if not present
+        if "RETAILER_ID" not in df.columns and "retailer_id" not in df.columns:
+            try:
+                args = parse_arguments()
+                df["retailer_id"] = args.retailer_id
+                logger.info(f"Added retailer_id: {args.retailer_id} to the data")
+            except:
+                logger.warning("Could not determine retailer_id, using default")
+                df["retailer_id"] = "DEFAULT_RETAILER"
+        
+        logger.info("Starting data transformation...")
+        df = transform_data(df)
+        
+        logger.info("Data ingestion and transformation completed successfully!")
+        return df
+        
+    except pd.errors.EmptyDataError:
+        error_msg = f"The file {file_path} is empty"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    except FileNotFoundError:
+        error_msg = f"The file {file_path} was not found"
+        logger.error(error_msg)
+        raise
+    except PermissionError:
+        error_msg = f"Permission denied when accessing {file_path}"
+        logger.error(error_msg)
+        raise
+    except Exception as e:
+        error_msg = f"Error during data ingestion and cleaning: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        raise
 
 def ensure_dimension_tables(engine, df):
     """Ensure all dimension tables exist and are populated."""
