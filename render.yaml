@@ -12,7 +12,9 @@ services:
       - key: UPLOAD_DIR
         value: "uploads"
       - key: PORT
-        value: "80"
+        value: "8000"  # Use 8000 to match uvicorn default
+      - key: DATABASE_URL
+        value: ""  # Will be automatically populated by Render
     plan: free
 
 databases:

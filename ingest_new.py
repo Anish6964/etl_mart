@@ -62,47 +62,91 @@ def validate_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
     Returns:
         Tuple of (validated DataFrame, validation_stats)
     """
-    validation_stats = {
-        "total_records": len(df),
-        "missing_required_fields": 0,
-        "invalid_numeric_values": 0,
-        "negative_values": 0,
-        "invalid_dates": 0,
-        "duplicate_records": 0,
-    }
+    try:
+        validation_stats = {
+            "total_records": len(df),
+            "missing_required_fields": 0,
+            "invalid_numeric_values": 0,
+            "negative_values": 0,
+            "invalid_dates": 0,
+            "duplicate_records": 0,
+        }
 
-    # Make a copy to avoid modifying the original
-    df_validated = df.copy()
+        # Make a copy to avoid modifying the original
+        df_validated = df.copy()
 
-    # 1. Map actual column names to expected names
-    column_mapping = {
-        "STORE_NAME": "STORE_ID",
-        "ITEM_CODE": "ITEM_CODE",
-        "QTY": "QTY",
-        "SALES_PRE_VAT": "SALES_AMOUNT",
-        "Date": "DATE",
-    }
+        # 1. Map actual column names to expected names
+        column_mapping = {
+            "STORE_NAME": "STORE_ID",
+            "ITEM_CODE": "ITEM_CODE",
+            "QTY": "QTY",
+            "SALES_PRE_VAT": "SALES_AMOUNT",
+            "Date": "DATE",
+        }
 
-    # Rename columns to standardize them
-    df_validated = df_validated.rename(columns=column_mapping)
+        # Rename columns to standardize them
+        df_validated = df_validated.rename(columns=column_mapping)
 
-    # 2. Check for required fields
-    required_fields = ["STORE_ID", "ITEM_CODE", "QTY", "SALES_AMOUNT", "DATE"]
+        # 2. Check for required fields
+        required_fields = ["STORE_ID", "ITEM_CODE", "QTY", "SALES_AMOUNT", "DATE"]
 
-    # Check which required fields are missing
-    missing_columns = [
-        col for col in required_fields if col not in df_validated.columns
-    ]
-    if missing_columns:
-        logger.warning(f"Missing required columns: {', '.join(missing_columns)}")
+        # Check which required fields are missing
+        missing_columns = [
+            col for col in required_fields if col not in df_validated.columns
+        ]
+        if missing_columns:
+            logger.warning(f"Missing required columns: {', '.join(missing_columns)}")
 
-    # Check for null values in existing required columns
-    existing_required = [col for col in required_fields if col in df_validated.columns]
-    if existing_required:
-        missing_required = df_validated[existing_required].isnull().any(axis=1)
-        validation_stats["missing_required_fields"] = missing_required.sum()
-    else:
-        validation_stats["missing_required_fields"] = len(df_validated)
+        # Check for null values in existing required columns
+        existing_required = [col for col in required_fields if col in df_validated.columns]
+        if existing_required:
+            missing_required = df_validated[existing_required].isnull().any(axis=1)
+            validation_stats["missing_required_fields"] = missing_required.sum()
+        else:
+            validation_stats["missing_required_fields"] = len(df_validated)
+
+        # 2. Check for invalid numeric values (negative values where not allowed)
+        numeric_fields = ["QTY", "SALES_AMOUNT", "PRICE", "COST", "STOCK_LEVEL"]
+
+        # First, ensure all numeric fields are actually numeric
+        for field in numeric_fields:
+            if field in df_validated.columns:
+                # Convert to string, clean, then to numeric
+                df_validated[field] = (
+                    df_validated[field].astype(str).str.replace(r"[^\d\.]", "", regex=True)
+                )
+                df_validated[field] = pd.to_numeric(df_validated[field], errors="coerce")
+
+                # Check for negative values
+                negative_values = df_validated[field] < 0
+                validation_stats["negative_values"] += negative_values.sum()
+
+                # Check for invalid numeric values (NaN)
+                invalid_numeric = df_validated[field].isnull()
+                validation_stats["invalid_numeric_values"] += invalid_numeric.sum()
+
+        # 3. Check for invalid dates
+        date_fields = ["DATE"]
+        for field in date_fields:
+            if field in df_validated.columns:
+                # Convert to datetime
+                df_validated[field] = pd.to_datetime(
+                    df_validated[field], errors="coerce", format="%Y-%m-%d"
+                )
+
+                # Check for invalid dates (NaN)
+                invalid_dates = df_validated[field].isnull()
+                validation_stats["invalid_dates"] += invalid_dates.sum()
+
+        # 4. Check for duplicate records
+        duplicate_records = df_validated.duplicated().sum()
+        validation_stats["duplicate_records"] += duplicate_records
+
+        return df_validated, validation_stats
+
+    except Exception as e:
+        logger.error(f"Error during validation: {e}")
+        return df, {"error": str(e)}
 
 
 # Configure logging

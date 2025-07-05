@@ -14,6 +14,8 @@ from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import pathlib
 from run_etl_pipeline import run_etl_pipeline
+import signal
+import sys
 
 # Configure logging first
 logging.basicConfig(
@@ -49,6 +51,38 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+# Graceful shutdown handler
+def shutdown_handler(signum, frame):
+    logger.info("Received shutdown signal. Cleaning up...")
+    try:
+        if scheduler:
+            scheduler.shutdown()
+            logger.info("Scheduler shut down")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
+
+# Get port from environment variable
+PORT = int(os.getenv("PORT", 8000))
+
 last_successful_load = None
 
 # CORS middleware
@@ -61,8 +95,8 @@ app.add_middleware(
 )
 
 if __name__ == "__main__":
-    port = int(os.getenv('PORT', 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    logger.info(f"Starting server on port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 def get_table_columns(engine, table_name):
     """Get list of columns in a table"""
