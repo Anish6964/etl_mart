@@ -26,7 +26,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from datetime import datetime, timedelta
 import traceback
 from typing import Dict, List, Optional, Tuple
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 DB_URL = os.getenv('DATABASE_URL')
 if not DB_URL:
     logger.error("DATABASE_URL environment variable not found")
-    DB_URL = "postgresql://postgres:postgres@localhost:5435/etl_db"
+    DB_URL = "postgresql://postgres:postgres@localhost:5432/etl_db"  # Default to standard PostgreSQL port
 DEFAULT_RETAILER_ID = "DEFAULT_RETAILER"
 DEFAULT_RETAILER_NAME = "Default Retailer"
 
@@ -349,42 +349,15 @@ def update_database_schema(engine):
         raise
 
 
-def create_db_connection(
-    host="localhost",
-    port=5432,
-    database="etl_db",
-    user="postgres",
-    password="postgres",
-    **kwargs,
-):
+def create_db_connection():
     """
-    Create and return a database connection.
-
-    Args:
-        host: Database host
-        port: Database port
-        database: Database name
-        user: Database user
-        password: Database password
-        **kwargs: Additional connection parameters
+    Create and return a database connection using DATABASE_URL.
 
     Returns:
         SQLAlchemy engine instance or None if connection fails
     """
     try:
-        # Construct the database URL
-        db_url = f"postgresql://{user}:{password}@{host}:{port}/{database}"
-
-        # Create engine with connection parameters
-        engine = create_engine(db_url, **kwargs)
-
-        # Test the connection
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-
-        # Create tables if they don't exist
-        Base.metadata.create_all(engine)
-
+        engine = create_engine(DB_URL)
         # Update schema if needed
         update_database_schema(engine)
 
@@ -1703,24 +1676,24 @@ def main():
 
         # Create database connection with extended timeout settings
         logger.info("Establishing database connection...")
-        engine = create_db_connection(
-            host="localhost",
-            port=5435,
-            database="etl_db",
-            user="postgres",
-            password="postgres",
-            # These parameters need to be passed in the query string
-            connect_args={
-                "connect_timeout": 60,  # Increased timeout for connection
-                "keepalives": 1,  # Enable keepalive
-                "keepalives_idle": 60,  # Idle time before sending keepalive
-                "keepalives_interval": 10,  # Interval between keepalives
-                "keepalives_count": 5,  # Number of keepalives before dropping connection
-                "options": "-c statement_timeout=3600000",  # 1 hour statement timeout
-            },
-            pool_pre_ping=True,  # Enable connection health checks
-            pool_recycle=3600,  # Recycle connections after 1 hour
-        )
+        # Create database connection using DATABASE_URL
+        engine = create_db_connection()
+        if not engine:
+            logger.error("Failed to connect to the database using DATABASE_URL")
+            return 1
+
+        # Set connection parameters
+        connect_args = {
+            "connect_timeout": 60,
+            "keepalives": 1,
+            "keepalives_idle": 60,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+            "options": "-c statement_timeout=3600000"
+        }
+        engine = engine.execution_options(connect_args=connect_args)
+        engine = engine.execution_options(pool_pre_ping=True)
+        engine = engine.execution_options(pool_recycle=3600)
 
         if not engine:
             logger.error("Failed to connect to the database. Exiting.")
