@@ -24,6 +24,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 import glob
+from typing import Optional, List
 
 # Configure logging
 logging.basicConfig(
