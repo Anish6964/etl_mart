@@ -30,6 +30,7 @@ from sqlalchemy.orm import declarative_base
 from datetime import datetime, timedelta
 import traceback
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 
 # Configure logging
@@ -41,10 +42,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Database configuration
+# Database configuration
 DB_URL = os.getenv('DATABASE_URL')
 if not DB_URL:
     logger.error("DATABASE_URL environment variable not found")
     DB_URL = "postgresql://postgres:postgres@localhost:5432/etl_db"  # Default to standard PostgreSQL port
+
+# Parse database URL components
+try:
+    result = urlparse(DB_URL)
+    username = result.username
+    password = result.password
+    database = result.path[1:]  # Remove leading slash
+    host = result.hostname
+    port = result.port
+except Exception as e:
+    logger.error(f"Failed to parse DATABASE_URL: {e}")
+    raise ValueError("Invalid DATABASE_URL format")
 DEFAULT_RETAILER_ID = "DEFAULT_RETAILER"
 DEFAULT_RETAILER_NAME = "Default Retailer"
 
@@ -349,6 +363,25 @@ def update_database_schema(engine):
         raise
 
 
+# Database configuration
+DB_URL = os.getenv('DATABASE_URL')
+if not DB_URL:
+    logger.error("DATABASE_URL environment variable not found")
+    DB_URL = "postgresql://postgres:postgres@localhost:5432/etl_db"  # Default to standard PostgreSQL port
+
+# Parse database URL components
+try:
+    result = urlparse(DB_URL)
+    username = result.username
+    password = result.password
+    database = result.path[1:]  # Remove leading slash
+    host = result.hostname
+    port = result.port
+except Exception as e:
+    logger.error(f"Failed to parse DATABASE_URL: {e}")
+    raise ValueError("Invalid DATABASE_URL format")
+
+
 def create_db_connection():
     """
     Create and return a database connection using DATABASE_URL.
@@ -357,763 +390,46 @@ def create_db_connection():
         SQLAlchemy engine instance or None if connection fails
     """
     try:
+        # First try to create engine directly with URL
         engine = create_engine(DB_URL)
-        # Update schema if needed
-        update_database_schema(engine)
-
-        logger.info(f"Successfully connected to database: {database} on {host}:{port}")
-        return engine
-
-    except Exception as e:
-        logger.error(f"Error creating database connection: {e}")
-        return None
-
-
-def clean_text(text: str) -> str:
-    """Clean and standardize text data."""
-    if not isinstance(text, str) or pd.isna(text):
-        return ""
-    # Remove extra whitespace and convert to title case
-    return " ".join(str(text).strip().split()).title()
-
-
-def extract_pack_size(sku_name: str) -> str:
-    """Extract pack size from SKU name."""
-    if not isinstance(sku_name, str):
-        return ""
-    # Look for patterns like 100g, 1kg, 500ml, etc.
-    match = re.search(
-        r"(\d+\s*(?:g|kg|ml|l|oz|lb|pcs?|pack|pk|ct))", sku_name, re.IGNORECASE
-    )
-    return match.group(1) if match else ""
-
-
-def validate_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """
-    Validate the input DataFrame for data quality issues.
-
-    Args:
-        df: Input DataFrame to validate
-
-    Returns:
-        Tuple of (validated DataFrame, validation_stats)
-    """
-    validation_stats = {
-        "total_records": len(df),
-        "missing_required_fields": 0,
-        "invalid_numeric_values": 0,
-        "negative_values": 0,
-        "invalid_dates": 0,
-        "duplicate_records": 0,
-    }
-
-    # Make a copy to avoid modifying the original
-    df_validated = df.copy()
-
-    # 1. Map actual column names to expected names
-    column_mapping = {
-        "STORE_NAME": "STORE_ID",
-        "ITEM_CODE": "ITEM_CODE",
-        "QTY": "QTY",
-        "SALES_PRE_VAT": "SALES_AMOUNT",
-        "Date": "DATE",
-    }
-
-    # Rename columns to standardize them
-    df_validated = df_validated.rename(columns=column_mapping)
-
-    # 2. Check for required fields
-    required_fields = ["STORE_ID", "ITEM_CODE", "QTY", "SALES_AMOUNT", "DATE"]
-
-    # Check which required fields are missing
-    missing_columns = [
-        col for col in required_fields if col not in df_validated.columns
-    ]
-    if missing_columns:
-        logger.warning(f"Missing required columns: {', '.join(missing_columns)}")
-
-    # Check for null values in existing required columns
-    existing_required = [col for col in required_fields if col in df_validated.columns]
-    if existing_required:
-        missing_required = df_validated[existing_required].isnull().any(axis=1)
-        validation_stats["missing_required_fields"] = missing_required.sum()
-    else:
-        validation_stats["missing_required_fields"] = len(df_validated)
-
-    # 2. Check for invalid numeric values (negative values where not allowed)
-    numeric_fields = ["QTY", "SALES_AMOUNT", "PRICE", "COST", "STOCK_LEVEL"]
-
-    # First, ensure all numeric fields are actually numeric
-    for field in numeric_fields:
-        if field in df_validated.columns:
-            # Convert to string, clean, then to numeric
-            df_validated[field] = (
-                df_validated[field].astype(str).str.replace(r"[^\d.-]", "", regex=True)
-            )
-            df_validated[field] = pd.to_numeric(df_validated[field], errors="coerce")
-            # Fill any remaining NaN with 0
-            df_validated[field] = df_validated[field].fillna(0)
-
-    # Now check for negative values in non-negative fields
-    non_negative_fields = ["QTY", "SALES_AMOUNT", "PRICE", "STOCK_LEVEL"]
-    for field in non_negative_fields:
-        if field in df_validated.columns:
-            # Check for negative values
-            negative_mask = df_validated[field] < 0
-            if negative_mask.any():
-                validation_stats["negative_values"] += negative_mask.sum()
-                # Replace negative values with 0
-                df_validated.loc[negative_mask, field] = 0
-
-    # 3. Validate dates
-    if "Date" in df_validated.columns:
-        df_validated["date_parsed"] = pd.to_datetime(
-            df_validated["Date"], errors="coerce"
-        )
-        invalid_dates = df_validated["date_parsed"].isna()
-        validation_stats["invalid_dates"] = invalid_dates.sum()
-
-        # Remove rows with invalid dates
-        df_validated = df_validated[~invalid_dates].copy()
-
-    # 4. Remove exact duplicates
-    duplicate_mask = df_validated.duplicated()
-    validation_stats["duplicate_records"] = duplicate_mask.sum()
-    df_validated = df_validated[~duplicate_mask].copy()
-
-    # Log validation results
-    logger.info("Data Validation Results:")
-    for stat, count in validation_stats.items():
-        logger.info(f"  - {stat.replace('_', ' ').title()}: {count:,}")
-
-    return df_validated, validation_stats
-
-
-def ingest_and_clean_data(file_path: str) -> pd.DataFrame:
-    """
-    Ingest, validate, and transform data from the CSV file.
-
-    This function performs the following steps:
-    1. Reads the CSV file with appropriate data types
-    2. Validates the data for quality issues
-    3. Transforms the data into the target schema
-
-    Args:
-        file_path: Path to the CSV file
-
-    Returns:
-        DataFrame: Processed DataFrame ready for database insertion
-
-    Raises:
-        Exception: If there's an error during the process
-    """
-    logger.info(f"Starting data ingestion from {file_path}")
-
-    try:
-        # Define expected columns and their data types
-        dtypes = {
-            "STORE_NAME": "str",
-            "ITEM_CODE": "str",
-            "ITEM_NAME": "str",
-            "CATEGORY": "str",
-            "DEPARTMENT": "str",
-            "QTY": "str",  # Will be converted to float after cleaning
-            "COST": "str",  # Will be converted to float after cleaning
-            "SALES_PRE_VAT": "str",  # Will be converted to float after cleaning
-            "SUPPLIER_NAME": "str",
-            "Date": "str",
-            "RRP": "str",  # Will be converted to float after cleaning
-            "PRICE": "str",  # Will be converted to float after cleaning
-            "TRANS_DATE": "str",
-            "PROMO_FLAG": "str",
-            "STOCK_LEVEL": "str",  # Will be converted to float after cleaning
-            "STOCK": "str",  # Will be converted to float after cleaning
-        }
-
-        # Read CSV file with error handling for different encodings
-        logger.info("Reading CSV file...")
+        
+        # Test connection
         try:
-            df = pd.read_csv(
-                file_path,
-                dtype=dtypes,
-                low_memory=False,
-                encoding="utf-8-sig",
-                thousands=",",
-            )
-        except UnicodeDecodeError:
-            logger.info("UTF-8 with BOM failed, trying latin-1 encoding...")
-            df = pd.read_csv(
-                file_path,
-                dtype=dtypes,
-                low_memory=False,
-                encoding="latin1",
-                thousands=",",
-            )
-
-        # Clean and convert numeric columns
-        numeric_columns = [
-            "QTY",
-            "COST",
-            "SALES_PRE_VAT",
-            "RRP",
-            "PRICE",
-            "STOCK_LEVEL",
-            "STOCK",
-        ]
-        for col in numeric_columns:
-            if col in df.columns:
-                # Remove any non-numeric characters except decimal point and negative sign
-                df[col] = df[col].astype(str).str.replace(r"[^\d.-]", "", regex=True)
-                # Convert to numeric, coerce errors to NaN
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-                # Fill NaN with 0 for numeric columns
-                df[col] = df[col].fillna(0)
-
-        logger.info(f"Successfully read {len(df):,} rows from {file_path}")
-
-        # Clean up column names (remove extra spaces, BOM, and standardize)
-        logger.info("Standardizing column names...")
-        df.columns = df.columns.str.strip()
-        df.columns = df.columns.str.replace("\ufeff", "")  # Remove BOM
-
-        # Perform data validation
-        logger.info("Starting data validation...")
-        df, validation_stats = validate_data(df)
-
-        # Log validation summary
-        logger.info("\n=== Data Validation Summary ===")
-        logger.info(f"Total records processed: {validation_stats['total_records']:,}")
-
-        if validation_stats["missing_required_fields"] > 0:
-            logger.warning(
-                f"  - Records with missing required fields: {validation_stats['missing_required_fields']:,}"
-            )
-        if validation_stats["invalid_numeric_values"] > 0:
-            logger.warning(
-                f"  - Records with invalid numeric values: {validation_stats['invalid_numeric_values']:,}"
-            )
-        if validation_stats["negative_values"] > 0:
-            logger.warning(
-                f"  - Records with unexpected negative values: {validation_stats['negative_values']:,}"
-            )
-        if validation_stats["invalid_dates"] > 0:
-            logger.warning(
-                f"  - Records with invalid dates: {validation_stats['invalid_dates']:,}"
-            )
-        if validation_stats["duplicate_records"] > 0:
-            logger.warning(
-                f"  - Duplicate records removed: {validation_stats['duplicate_records']:,}"
-            )
-
-        valid_records = len(df)
-        logger.info(
-            f"\nValid records remaining: {valid_records:,} "
-            f"({valid_records/validation_stats['total_records']*100:.1f}% of original)"
-        )
-        logger.info("================================\n")
-
-        if valid_records == 0:
-            logger.warning("No valid records remaining after validation!")
-            return pd.DataFrame()
-
-        # Add retailer_id to the dataframe if it doesn't exist
-        if "RETAILER_ID" not in df.columns and "retailer_id" not in df.columns:
-            # Get retailer_id from command line arguments if available
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            logger.info(f"Successfully connected to database")
+            
+            # Update schema if needed
+            update_database_schema(engine)
+            
+            return engine
+        except Exception as e:
+            logger.error(f"Connection test failed: {str(e)}")
+            
+            # If direct connection fails, try using parsed components
             try:
-                args = parse_arguments()
-                df["retailer_id"] = args.retailer_id
-                logger.info(f"Added retailer_id: {args.retailer_id} to the data")
-            except:
-                logger.warning("Could not determine retailer_id, using default")
-                df["retailer_id"] = "DEFAULT_RETAILER"
-
-        # Transform the data into the target schema
-        logger.info("Starting data transformation...")
-        df = transform_data(df)
-
-        logger.info("Data ingestion and transformation completed successfully!")
-        return df
-
-    except pd.errors.EmptyDataError:
-        error_msg = f"The file {file_path} is empty"
-        logger.error(error_msg)
-        raise ValueError(error_msg)
-    except FileNotFoundError:
-        error_msg = f"The file {file_path} was not found"
-        logger.error(error_msg)
-        raise
-    except PermissionError:
-        error_msg = f"Permission denied when accessing {file_path}"
-        logger.error(error_msg)
-        raise
-    except Exception as e:
-        error_msg = f"Error during data ingestion and cleaning: {str(e)}"
-        logger.error(error_msg)
-        logger.error(traceback.format_exc())
-        raise
-
-
-def transform_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Transform the validated data into the target schema.
-
-    Args:
-        df: Validated DataFrame from validate_data()
-
-    Returns:
-        DataFrame: Transformed data ready for database insertion
-    """
-    logger.info("Starting data transformation")
-
-    try:
-        # Create a copy to avoid modifying the original
-        df_transformed = df.copy()
-
-        # Map source columns to target columns
-        # Using RRP as price if PRICE is not available
-        column_mapping = {
-            "STORE_ID": "store_id",
-            "ITEM_CODE": "sku_id",
-            "QTY": "units_sold",
-            "SALES_AMOUNT": "sales_value",
-            "DATE": "date",
-            "RRP": "price",  # Use RRP as price if PRICE is not available
-            "COST": "cost",
-            "STOCK": "stock_level",  # Use STOCK if STOCK_LEVEL is not available
-            "RETAILER_ID": "retailer_id",  # Map RETAILER_ID to retailer_id
-            "retailer_id": "retailer_id",  # Also handle if already in lowercase
-        }
-
-        # Initialize all required columns with None
-        required_columns = [
-            "store_id",
-            "sku_id",
-            "units_sold",
-            "sales_value",
-            "date",
-            "price",
-            "cost",
-            "stock_level",
-            "promo_active",
-            "retailer_id",
-        ]
-
-        # Create a new DataFrame with all required columns
-        result = pd.DataFrame(columns=required_columns)
-
-        # Map and copy columns that exist in the source
-        for src_col, tgt_col in column_mapping.items():
-            if src_col in df_transformed.columns:
-                result[tgt_col] = df_transformed[src_col]
-
-        # If retailer_id is not in the source, try to get it from the command line args
-        if (
-            "retailer_id" not in result.columns
-            and "RETAILER_ID" not in df_transformed.columns
-        ):
-            try:
-                args = parse_arguments()
-                result["retailer_id"] = args.retailer_id
-                logger.info(f"Added retailer_id from command line: {args.retailer_id}")
+                db_url = f"postgresql://{username}:{password}@{host}:{port}/{database}"
+                engine = create_engine(db_url)
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                logger.info(f"Successfully connected using parsed components")
+                
+                # Update schema if needed
+                update_database_schema(engine)
+                
+                return engine
             except Exception as e:
-                logger.warning(f"Could not get retailer_id from command line: {e}")
-                result["retailer_id"] = "DEFAULT_RETAILER"
-
-        # Set default values for missing required columns
-        if "promo_active" not in result.columns:
-            result["promo_active"] = False
-
-        # If price is still missing, try to calculate from sales_value/units_sold
-        if (
-            "price" not in result.columns
-            and "sales_value" in result.columns
-            and "units_sold" in result.columns
-        ):
-            result["price"] = result["sales_value"] / result["units_sold"].replace(0, 1)
-
-        # Set default stock level if missing
-        if "stock_level" not in result.columns:
-            result["stock_level"] = 0
-
-        # Set default cost if missing
-        if "cost" not in result.columns:
-            result["cost"] = 0
-
-        # Convert date to datetime.date
-        if "date" in result.columns:
-            # First try to parse with specific format if possible
-            try:
-                result["date"] = pd.to_datetime(
-                    result["date"], format="%d/%m/%Y", errors="coerce"
-                )
-                # If parsing failed for all, try without format
-                if result["date"].isna().all():
-                    result["date"] = pd.to_datetime(result["date"], errors="coerce")
-                result["date"] = result["date"].dt.date
-                # If still no dates, use today's date as fallback
-                if result["date"].isna().all():
-                    result["date"] = pd.Timestamp.today().date()
-            except Exception as e:
-                logger.warning(
-                    f"Error parsing dates: {e}. Using today's date as fallback."
-                )
-                result["date"] = pd.Timestamp.today().date()
-        else:
-            # If date column is missing, use today's date
-            result["date"] = pd.Timestamp.today().date()
-
-        # Ensure promo_active is boolean
-        if "promo_active" not in result.columns:
-            result["promo_active"] = False
-        result["promo_active"] = result["promo_active"].fillna(False).astype(bool)
-
-        # Ensure numeric columns have the correct type and handle any non-numeric values
-        numeric_columns = ["units_sold", "sales_value", "price", "cost", "stock_level"]
-        for col in numeric_columns:
-            if col in result.columns:
-                # Convert to string first to handle any non-numeric characters
-                result[col] = (
-                    result[col].astype(str).str.replace(r"[^\d.-]", "", regex=True)
-                )
-                result[col] = pd.to_numeric(result[col], errors="coerce")
-                result[col] = result[col].fillna(0)
-
-        # Check for missing required columns
-        missing_columns = [
-            col
-            for col in required_columns
-            if col not in result.columns or result[col].isnull().all()
-        ]
-        if missing_columns:
-            raise ValueError(
-                f"Missing required columns after transformation: {', '.join(missing_columns)}"
-            )
-
-        logger.info(f"Successfully transformed {len(result)} records")
-        return result
-
-    except Exception as e:
-        logger.error(f"Error during data transformation: {e}")
-        logger.error(traceback.format_exc())
-        raise
-        df.columns = df.columns.str.strip()
-        df.columns = df.columns.str.replace("\ufeff", "")  # Remove BOM
-
-        # Define column mapping with case-insensitive matching
-        column_mapping = {
-            "STORE_NAME": "store_name",
-            "STORE_ID": "store_id",
-            "ITEM_CODE": "sku_id",
-            "ITEM_NAME": "sku_name",
-            "ITEM_DESC": "sku_name",  # Alternative column name
-            "CATEGORY": "category",
-            "DEPT": "department",
-            "DEPARTMENT": "department",
-            "QTY": "units_sold",
-            "QUANTITY": "units_sold",
-            "SALES_PRE_VAT": "sales_value",
-            "SALES_AMOUNT": "sales_value",
-            "RRP": "price",
-            "PRICE": "price",
-            "Date": "date",
-            "TRANS_DATE": "date",
-            "COST": "cost",
-            "PROMO_FLAG": "promo_flag",
-            "PROMOTION": "promo_flag",
-            "STOCK_LEVEL": "stock_level",
-            "STOCK": "stock_level",
-        }
-
-        # Apply case-insensitive column mapping
-        df.columns = df.columns.str.upper()
-        column_mapping = {k.upper(): v for k, v in column_mapping.items()}
-
-        # Only include columns that exist in the dataframe
-        column_mapping = {
-            k: v
-            for k, v in column_mapping.items()
-            if k in df.columns
-            and v
-            in [
-                "store_name",
-                "store_id",
-                "sku_id",
-                "sku_name",
-                "category",
-                "department",
-                "units_sold",
-                "sales_value",
-                "price",
-                "date",
-                "cost",
-                "promo_flag",
-                "stock_level",
-            ]
-        }
-
-        # Rename columns
-        df = df.rename(columns=column_mapping)
-
-        # Add retailer information (default if not provided)
-        df["retailer_id"] = DEFAULT_RETAILER_ID
-
-        # Only include columns that exist in the dataframe
-        column_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
-        df = df.rename(columns=column_mapping)
-
-        # Standardize and clean text fields
-        text_columns = [
-            "store_name",
-            "store_id",
-            "sku_id",
-            "sku_name",
-            "category",
-            "department",
-        ]
-        for col in text_columns:
-            if col in df.columns:
-                df[col] = df[col].fillna("").astype(str).apply(clean_text)
-
-        # Ensure sku_id is treated as string and clean it
-        if "sku_id" not in df.columns and "ITEM_CODE" in df.columns:
-            df["sku_id"] = df["ITEM_CODE"]
-        df["sku_id"] = df["sku_id"].astype(str).str.strip()
-
-        # Handle dates - try multiple date formats
-        date_columns = ["date", "transaction_date", "sale_date"]
-        for date_col in date_columns:
-            if date_col in df.columns:
-                try:
-                    # Try parsing as full date first
-                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-                    # If that fails, try assuming it's a day number in May 2025
-                    if df[date_col].isna().any():
-                        df[date_col] = pd.to_datetime(
-                            "2025-05-" + df[date_col].astype(str),
-                            format="%Y-%m-%d",
-                            errors="coerce",
-                        )
-                    break
-                except:
-                    continue
-
-        # If still no valid date, use today's date
-        if "date" not in df.columns or df["date"].isna().all():
-            df["date"] = datetime.today()
-
-        # Create store_id if not provided
-        if "store_id" not in df.columns and "store_name" in df.columns:
-            df["store_id"] = df["store_name"].apply(
-                lambda x: str(abs(hash(str(x))))[-10:] if pd.notna(x) else None
-            )
-
-        # Ensure numeric columns are the right type and handle negatives
-        numeric_cols = ["units_sold", "sales_value", "price", "cost", "stock_level"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-                # Convert negative values to positive (assuming data entry error)
-                if col in ["units_sold", "stock_level"]:
-                    df[col] = df[col].abs()
-
-        # Handle promo flag - convert various formats to boolean
-        if "promo_flag" in df.columns:
-            df["promo_active"] = (
-                df["promo_flag"]
-                .astype(str)
-                .str.upper()
-                .isin(["TRUE", "YES", "Y", "1", "PROMO"])
-            )
-        else:
-            df["promo_active"] = False
-
-        # Extract pack size from SKU name
-        if "sku_name" in df.columns:
-            df["pack_size"] = df["sku_name"].apply(extract_pack_size)
-        else:
-            df["pack_size"] = ""
-
-        # Calculate derived metrics
-        if (
-            "price" not in df.columns
-            and "sales_value" in df.columns
-            and "units_sold" in df.columns
-        ):
-            df["price"] = df["sales_value"] / df["units_sold"].replace(0, np.nan)
-
-        if "cost" not in df.columns and "price" in df.columns:
-            # Default to 70% of price if cost not provided
-            df["cost"] = df["price"] * 0.7
-
-        if "stock_level" not in df.columns:
-            # Default stock level to 0 if not provided
-            df["stock_level"] = 0
-
-        # Define required columns with fallbacks
-        required_columns = [
-            "store_id",
-            "sku_id",
-            "units_sold",
-            "sales_value",
-            "price",
-            "date",
-        ]
-
-        # Log data quality issues before dropping
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            logger.warning(f"Missing required columns: {', '.join(missing_columns)}")
-
-        # Drop rows with missing values in key columns
-        df_cleaned = df.copy()
-        missing_before = len(df_cleaned)
-        df_cleaned = df_cleaned.dropna(
-            subset=[col for col in required_columns if col in df_cleaned.columns]
-        )
-        missing_after = len(df_cleaned)
-
-        # Log data quality metrics
-        logger.info("\n=== Data Quality Report ===")
-        logger.info(f"Original rows: {len(df):,}")
-        logger.info(f"Rows after cleaning: {len(df_cleaned):,}")
-        logger.info(
-            f"Rows dropped: {missing_before - missing_after:,} ({(missing_before - missing_after) / missing_before * 100:.1f}%)"
-        )
-
-        # Log sample of the data
-        sample_cols = [
-            "retailer_id",
-            "store_id",
-            "sku_id",
-            "date",
-            "units_sold",
-            "sales_value",
-            "price",
-            "promo_active",
-        ]
-        sample_cols = [col for col in sample_cols if col in df_cleaned.columns]
-        logger.info("\n=== Sample of cleaned data ===")
-        logger.info(df_cleaned[sample_cols].head().to_string())
-
-        # Log data types and memory usage
-        logger.info("\n=== Data Types ===")
-        logger.info(df_cleaned.dtypes)
-
-        return df_cleaned
-
-    except Exception as e:
-        print(f"Error reading or cleaning data: {e}")
-        traceback.print_exc()
+                logger.error(f"Failed to connect using parsed components: {str(e)}")
+                return None
+    except SQLAlchemyError as e:
+        logger.error(f"Database connection failed: {str(e)}")
         return None
-
-
-def populate_time_dimension(engine, start_date, end_date):
-    """Populate the time dimension table with dates between start_date and end_date."""
-    try:
-        logger.info(f"Populating time dimension from {start_date} to {end_date}")
-
-        # Convert string dates to datetime if needed
-        if isinstance(start_date, str):
-            start_date = pd.to_datetime(start_date).date()
-        if isinstance(end_date, str):
-            end_date = pd.to_datetime(end_date).date()
-
-        # Generate all dates in the range
-        dates = pd.date_range(start=start_date, end=end_date, freq="D")
-
-        # Prepare time dimension data
-        time_data = []
-        for date in dates:
-            time_data.append(
-                {
-                    "date": date.date(),
-                    "day_of_week": date.dayofweek + 1,  # 1-7 for Monday-Sunday
-                    "day_name": date.strftime("%A"),
-                    "week_number": date.isocalendar()[1],
-                    "month_number": date.month,
-                    "month_name": date.strftime("%B"),
-                    "quarter": (date.month - 1) // 3 + 1,
-                    "year": date.year,
-                    "is_weekend": date.dayofweek >= 5,  # 5=Saturday, 6=Sunday
-                }
-            )
-
-        if not time_data:
-            logger.warning("No dates to insert into time dimension")
-            return 0
-
-        # Insert in batches
-        batch_size = 1000
-        total_inserted = 0
-
-        with engine.connect() as conn:
-            for i in range(0, len(time_data), batch_size):
-                batch = time_data[i : i + batch_size]
-                try:
-                    result = conn.execute(
-                        text(
-                            """
-                        INSERT INTO dim_time (
-                            date, day_of_week, day_name, week_number, 
-                            month_number, month_name, quarter, year, is_weekend
-                        ) VALUES (
-                            :date, :day_of_week, :day_name, :week_number,
-                            :month_number, :month_name, :quarter, :year, :is_weekend
-                        ) ON CONFLICT (date) DO NOTHING
-                        """
-                        ),
-                        batch,
-                    )
-                    total_inserted += result.rowcount
-                    conn.commit()
-
-                    if i % (batch_size * 10) == 0:
-                        logger.info(
-                            f"  - Processed {min(i + len(batch), len(time_data))}/{len(time_data)} dates"
-                        )
-
-                except Exception as e:
-                    conn.rollback()
-                    logger.error(f"Error inserting batch {i//batch_size + 1}: {e}")
-                    # Try inserting rows one by one to identify problematic rows
-                    for j, row in enumerate(batch):
-                        try:
-                            result = conn.execute(
-                                text(
-                                    """
-                                INSERT INTO dim_time (
-                                    date, day_of_week, day_name, week_number, 
-                                    month_number, month_name, quarter, year, is_weekend
-                                ) VALUES (
-                                    :date, :day_of_week, :day_name, :week_number,
-                                    :month_number, :month_name, :quarter, :year, :is_weekend
-                                ) ON CONFLICT (date) DO NOTHING
-                                """
-                                ),
-                                row,
-                            )
-                            total_inserted += result.rowcount
-                            conn.commit()
-                        except Exception as inner_e:
-                            logger.error(
-                                f"  - Failed to insert date {row.get('date')}: {inner_e}"
-                            )
-                            conn.rollback()
-                            continue
-
-        logger.info(f"Successfully inserted/updated {total_inserted} rows in dim_time")
-        return total_inserted
-
-    except Exception as e:
-        logger.error(f"Error populating time dimension: {e}")
-        if "conn" in locals():
-            conn.rollback()
-        raise
 
 
 def insert_dimension_data(engine, df, table_name, id_col, value_cols, retailer_id=None):
     """
     Insert or update data in a dimension table with improved error handling and logging.
+    {{ ... }}
 
     Args:
         engine: SQLAlchemy engine
